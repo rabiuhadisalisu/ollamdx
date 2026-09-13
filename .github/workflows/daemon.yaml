@@ -12,18 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
-    env:
-      OLLAMA_HOME: /home/runner/.ollama
-      OLLAMA_MODELS: /home/runner/.ollama/models
-      OLLAMA_LOGS: /home/runner/ollama-logs
-      OLLAMA_HOST: "0.0.0.0:11434"
-      OLLAMA_LLM_LIBRARY: "cpu"
-      OLLAMA_NUM_PARALLEL: "1"
-      OLLAMA_MAX_LOADED_MODELS: "1"
-      OLLAMA_KEEP_ALIVE: "24h"
-      OLLAMA_KV_CACHE_TYPE: "q8_0"
-      OLLAMA_FLASH_ATTENTION: "false"
-
     steps:
       # --------------------------------------------------------
       # 1. CHECKOUT
@@ -36,8 +24,8 @@ jobs:
       # --------------------------------------------------------
       - name: Install Dependencies
         run: |
-          sudo apt update -y
-          sudo apt install -y zstd curl jq
+          sudo apt-get update -y
+          sudo apt-get install -y zstd curl jq
           echo "[+] Dependencies installed."
 
       # --------------------------------------------------------
@@ -46,7 +34,7 @@ jobs:
       - name: Install Ollama
         run: |
           curl -fsSL https://ollama.com/install.sh | bash
-          echo "[+] Ollama installed: $(ollama --version)"
+          ollama --version && echo "[+] Ollama installed successfully."
 
       # --------------------------------------------------------
       # 4. DETECT HARDWARE RESOURCES
@@ -54,13 +42,16 @@ jobs:
       - name: Detect Hardware Resources
         id: hardware
         run: |
-          TOTAL_RAM_KB=$(grep MemTotal    /proc/meminfo | awk '{print $2}')
+          TOTAL_RAM_KB=$(grep MemTotal     /proc/meminfo | awk '{print $2}')
           AVAIL_RAM_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
           TOTAL_RAM_GB=$((TOTAL_RAM_KB / 1024 / 1024))
           AVAIL_RAM_GB=$((AVAIL_RAM_KB / 1024 / 1024))
           CPU_CORES=$(nproc)
           CPU_MODEL=$(grep "model name" /proc/cpuinfo | head -1 | cut -d: -f2 | xargs)
           CPU_SHORT=$(printf "%.40s" "$CPU_MODEL")
+
+          # Ensure at least 1GB is reported (safety)
+          [ "$AVAIL_RAM_GB" -lt 1 ] && AVAIL_RAM_GB=1
 
           echo "total_ram=$TOTAL_RAM_GB" >> $GITHUB_OUTPUT
           echo "avail_ram=$AVAIL_RAM_GB" >> $GITHUB_OUTPUT
@@ -74,7 +65,7 @@ jobs:
           echo " Cores     : $CPU_CORES"
           echo " Total RAM : ${TOTAL_RAM_GB}GB"
           echo " Avail RAM : ${AVAIL_RAM_GB}GB"
-          echo " Runner    : $(whoami) @ $(hostname)"
+          echo " Runner    : $(whoami)"
           echo " Home      : $HOME"
           echo "============================================="
 
@@ -87,6 +78,9 @@ jobs:
           MODEL_BASE="orcarouter/Qwen3.8-27B-Uncensored"
           AVAIL_RAM_GB=${{ steps.hardware.outputs.avail_ram }}
           SAFE_LIMIT=$((AVAIL_RAM_GB - 6))
+
+          # Ensure safe limit is not negative
+          [ "$SAFE_LIMIT" -lt 1 ] && SAFE_LIMIT=1
 
           declare -a MODEL_TAGS=(
             "q8_0:29:Highest quality 8-bit"
@@ -125,12 +119,13 @@ jobs:
             fi
           done
 
-          # Fallback to smallest
+          # Always fallback to smallest if nothing fits
           if [ -z "$SELECTED_TAG" ]; then
             SELECTED_TAG="iq2_xxs"
             SELECTED_SIZE=9
             SELECTED_DESC="Minimum 2-bit XXS fallback"
-            printf " [FALLBACK] %-12s %4sGB  %s\n" "$SELECTED_TAG" "$SELECTED_SIZE" "$SELECTED_DESC"
+            printf " [FALLBACK] %-12s %4sGB  %s\n" \
+              "$SELECTED_TAG" "$SELECTED_SIZE" "$SELECTED_DESC"
           fi
 
           SELECTED_MODEL="${MODEL_BASE}:${SELECTED_TAG}"
@@ -156,18 +151,24 @@ jobs:
           [ "$CTX" -gt 4096 ] && CTX=4096
           [ "$CTX" -lt 512  ] && CTX=512
 
-          # FIX: Use $HOME instead of /root (runner user has no /root access)
-          mkdir -p "$HOME/.ollama/models"
-          mkdir -p "$HOME/ollama-logs"
+          # Use $HOME — runners do not have access to /root
+          OLLAMA_MODELS_DIR="$HOME/.ollama/models"
+          OLLAMA_LOGS_DIR="$HOME/ollama-logs"
 
-          echo "[+] Directories created:"
-          echo "    Models : $HOME/.ollama/models"
-          echo "    Logs   : $HOME/ollama-logs"
-          echo "    Runner : $(whoami)"
+          mkdir -p "$OLLAMA_MODELS_DIR"
+          mkdir -p "$OLLAMA_LOGS_DIR"
 
-          # Write env file using $HOME
-          cat > /tmp/ollama_env.sh << EOF
-          export OLLAMA_MODELS="$HOME/.ollama/models"
+          echo "[+] Directories:"
+          echo "    Models : $OLLAMA_MODELS_DIR"
+          echo "    Logs   : $OLLAMA_LOGS_DIR"
+
+          # Save CTX and paths for subsequent steps
+          echo "$CTX"               > /tmp/ollama_ctx
+          echo "$OLLAMA_LOGS_DIR"   > /tmp/ollama_logs_dir
+          echo "$OLLAMA_MODELS_DIR" > /tmp/ollama_models_dir
+
+          # Set all environment variables
+          export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
           export OLLAMA_HOST="0.0.0.0:11434"
           export OLLAMA_LLM_LIBRARY="cpu"
           export OLLAMA_NUM_PARALLEL=1
@@ -177,25 +178,12 @@ jobs:
           export OLLAMA_CONTEXT_LENGTH=$CTX
           export OLLAMA_KV_CACHE_TYPE="q8_0"
           export OLLAMA_FLASH_ATTENTION=false
-          EOF
-
-          source /tmp/ollama_env.sh
 
           # Start Ollama server
-          nohup ollama serve > "$HOME/ollama-logs/server.log" 2>&1 &
-          OLLAMA_PID=$!
-          echo "[+] Ollama server started. PID: $OLLAMA_PID"
+          nohup ollama serve > "$OLLAMA_LOGS_DIR/server.log" 2>&1 &
+          echo "[+] Ollama server started. PID: $!"
 
-          # OOM protection (best effort, may not work on hosted runners)
-          sleep 2
-          OPID=$(pgrep -f "ollama serve" | head -1 || true)
-          if [ -n "$OPID" ]; then
-            echo -17 > /proc/$OPID/oom_adj 2>/dev/null && \
-              echo "[+] OOM protection applied to PID: $OPID" || \
-              echo "[!] OOM protection skipped (no permission, non-critical)"
-          fi
-
-          # Wait for API (up to 30s)
+          # Wait for API to be ready (up to 30s)
           echo "[*] Waiting for Ollama API..."
           API_READY=false
           for i in $(seq 1 30); do
@@ -208,18 +196,19 @@ jobs:
           done
 
           if [ "$API_READY" = "false" ]; then
-            echo "[-] API failed to start. Server log:"
-            cat "$HOME/ollama-logs/server.log"
+            echo "[-] Ollama API failed to start. Server log:"
+            cat "$OLLAMA_LOGS_DIR/server.log"
             exit 1
           fi
 
-          # Verify RAM detection
+          # RAM detection check
           echo ""
-          echo "[*] RAM detection check:"
-          grep "inference compute" "$HOME/ollama-logs/server.log" || true
+          echo "[*] RAM detection:"
+          grep "inference compute" "$OLLAMA_LOGS_DIR/server.log" || \
+            echo "[!] inference compute line not found yet (non-critical)"
 
-          if grep -q "953.7 MiB" "$HOME/ollama-logs/server.log" 2>/dev/null; then
-            echo "[-] WARNING: tmpfs RAM limit detected. OLLAMA_MODELS path may be wrong."
+          if grep -q "953.7 MiB" "$OLLAMA_LOGS_DIR/server.log" 2>/dev/null; then
+            echo "[-] WARNING: tmpfs RAM limit detected."
           else
             echo "[+] RAM detection looks correct."
           fi
@@ -227,10 +216,7 @@ jobs:
           echo ""
           echo " Context Length : $CTX tokens"
           echo " CPU Threads    : $CPU_CORES"
-          echo " Model Storage  : $HOME/.ollama/models"
-
-          # Save CTX for later steps
-          echo $CTX > /tmp/ollama_ctx
+          echo " Model Storage  : $OLLAMA_MODELS_DIR"
 
       # --------------------------------------------------------
       # 7. PULL MODEL
@@ -238,26 +224,35 @@ jobs:
       - name: Pull Model
         run: |
           SELECTED_MODEL="${{ steps.model.outputs.selected_model }}"
-          source /tmp/ollama_env.sh
+          OLLAMA_LOGS_DIR=$(cat /tmp/ollama_logs_dir)
+          OLLAMA_MODELS_DIR=$(cat /tmp/ollama_models_dir)
+
+          export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
+          export OLLAMA_HOST="0.0.0.0:11434"
 
           echo "[*] Pulling: $SELECTED_MODEL"
           echo "[*] This may take several minutes..."
-          ollama pull "$SELECTED_MODEL" 2>&1 | tee "$HOME/ollama-logs/pull.log"
+
+          ollama pull "$SELECTED_MODEL" 2>&1 | tee "$OLLAMA_LOGS_DIR/pull.log"
+
           echo "[+] Pull complete."
 
       # --------------------------------------------------------
-      # 8. WARMUP - Initial Load Into RAM
+      # 8. WARMUP - Force Model Into RAM
       # --------------------------------------------------------
       - name: Warmup Model
         run: |
           SELECTED_MODEL="${{ steps.model.outputs.selected_model }}"
           CPU_CORES=${{ steps.hardware.outputs.cpu_cores }}
           CTX=$(cat /tmp/ollama_ctx)
+          OLLAMA_LOGS_DIR=$(cat /tmp/ollama_logs_dir)
 
           echo "[*] Warming up: $SELECTED_MODEL"
-          echo "[*] Sending initial request to load model into RAM..."
+          echo "[*] Forcing model load into RAM with keep_alive 24h..."
 
-          curl -s --max-time 600 \
+          HTTP_CODE=$(curl -s -o "$OLLAMA_LOGS_DIR/warmup.log" \
+            -w "%{http_code}" \
+            --max-time 600 \
             http://127.0.0.1:11434/api/generate \
             -H "Content-Type: application/json" \
             -d "{
@@ -269,20 +264,31 @@ jobs:
                 \"num_ctx\": $CTX,
                 \"num_thread\": $CPU_CORES
               }
-            }" > "$HOME/ollama-logs/warmup.log" 2>&1
+            }")
+
+          echo "[+] Warmup HTTP status: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "[-] Warmup failed with HTTP $HTTP_CODE"
+            cat "$OLLAMA_LOGS_DIR/warmup.log"
+            echo "--- Server Log (last 20 lines) ---"
+            tail -20 "$OLLAMA_LOGS_DIR/server.log"
+            exit 1
+          fi
 
           echo "[+] Warmup response:"
-          cat "$HOME/ollama-logs/warmup.log" \
+          cat "$OLLAMA_LOGS_DIR/warmup.log" \
             | jq '{response, done, load_duration, eval_duration}' 2>/dev/null \
-            || cat "$HOME/ollama-logs/warmup.log"
+            || cat "$OLLAMA_LOGS_DIR/warmup.log"
 
       # --------------------------------------------------------
       # 9. CLOUDFLARE TUNNEL
       # --------------------------------------------------------
       - name: Start Cloudflare Tunnel
-        env:
-          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
+          CF_TOKEN="eyJhIjoiMzk0M2Q0ZWMxOGM1MzkxZmJiZTkxNThhNWQ2MjliNTUiLCJ0IjoiYzEwMTlkNmUtODI4ZC00YTk3LTliNzQtMmQ3NzEyODM1Y2FhIiwicyI6IlpEbGlZek16T1RRdFkyVmtPUzAwTW1ObUxUa3paV0l0TkRZMVpEUTRNVFk1Wm1FMyJ9"
+          OLLAMA_LOGS_DIR=$(cat /tmp/ollama_logs_dir)
+
           # Install cloudflared if missing
           if ! command -v cloudflared > /dev/null 2>&1; then
             echo "[*] Installing cloudflared..."
@@ -290,36 +296,48 @@ jobs:
               | sudo tee /usr/share/keyrings/cloudflare-main.gpg > /dev/null
             echo 'deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared noble main' \
               | sudo tee /etc/apt/sources.list.d/cloudflared.list
-            sudo apt update -y > /dev/null 2>&1
-            sudo apt install -y cloudflared > /dev/null 2>&1
+            sudo apt-get update -y > /dev/null 2>&1
+            sudo apt-get install -y cloudflared > /dev/null 2>&1
+            echo "[+] cloudflared installed: $(cloudflared --version)"
+          else
+            echo "[+] cloudflared already present: $(cloudflared --version)"
           fi
 
-          echo "[+] cloudflared: $(cloudflared --version)"
+          # Remove any existing service cleanly
+          sudo cloudflared service uninstall 2>/dev/null || true
+          sudo pkill -f "cloudflared" 2>/dev/null || true
+          sleep 2
 
-          # Kill any existing tunnel
-          pkill -f "cloudflared" 2>/dev/null || true
-          sleep 1
+          # Install as system service using token
+          echo "[*] Installing Cloudflare tunnel as system service..."
+          sudo cloudflared service install "$CF_TOKEN"
 
-          # Start tunnel manually (service install needs root)
-          nohup cloudflared tunnel --no-autoupdate run \
-            --token "$CF_TOKEN" \
-            > "$HOME/ollama-logs/cloudflared.log" 2>&1 &
-          echo "[+] Cloudflare tunnel started. PID: $!"
-
-          # Wait for connection
-          echo "[*] Waiting for tunnel to connect..."
+          # Wait for service to become active (up to 30s)
+          echo "[*] Waiting for cloudflared service to start..."
+          SERVICE_UP=false
           for i in $(seq 1 15); do
-            if grep -qE "Registered tunnel|Connection|connectedRemote" \
-               "$HOME/ollama-logs/cloudflared.log" 2>/dev/null; then
-              echo "[+] Tunnel connected after $((i * 2))s"
+            if sudo systemctl is-active --quiet cloudflared 2>/dev/null; then
+              echo "[+] cloudflared service active after $((i * 2))s"
+              SERVICE_UP=true
               break
             fi
             sleep 2
           done
 
+          if [ "$SERVICE_UP" = "false" ]; then
+            echo "[-] cloudflared service did not start. Checking status..."
+            sudo systemctl status cloudflared --no-pager || true
+            sudo journalctl -u cloudflared -n 50 --no-pager || true
+            exit 1
+          fi
+
           echo ""
-          echo "--- Cloudflare Tunnel Log ---"
-          cat "$HOME/ollama-logs/cloudflared.log" || true
+          echo "--- Service Status ---"
+          sudo systemctl status cloudflared --no-pager || true
+
+          echo ""
+          echo "--- Tunnel Logs ---"
+          sudo journalctl -u cloudflared -n 30 --no-pager || true
 
       # --------------------------------------------------------
       # 10. TEST PROMPT - Verify Model & Resources Ready
@@ -330,6 +348,7 @@ jobs:
           CPU_CORES=${{ steps.hardware.outputs.cpu_cores }}
           AVAIL_RAM_GB=${{ steps.hardware.outputs.avail_ram }}
           CTX=$(cat /tmp/ollama_ctx)
+          OLLAMA_LOGS_DIR=$(cat /tmp/ollama_logs_dir)
 
           echo "============================================="
           echo " TEST PROMPT"
@@ -342,19 +361,19 @@ jobs:
           echo "[*] Waiting for model to be ready in memory..."
           READY=false
           for i in $(seq 1 60); do
-            STATUS=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null)
-            LOADED=$(echo "$STATUS" | jq -r '.models[0].name // empty' 2>/dev/null || true)
+            API_PS=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null || true)
+            LOADED=$(echo "$API_PS" | jq -r '.models[0].name // empty' 2>/dev/null || true)
             if [ -n "$LOADED" ]; then
-              echo "[+] Model confirmed loaded: $LOADED"
+              echo "[+] Model confirmed in memory: $LOADED"
               READY=true
               break
             fi
-            printf "    [%02d/60] Not yet in memory, waiting 10s...\n" "$i"
+            printf "    [%02d/60] Not yet loaded, waiting 10s...\n" "$i"
             sleep 10
           done
 
           if [ "$READY" = "false" ]; then
-            echo "[!] Model not in /api/ps. Proceeding with cold test..."
+            echo "[!] Model not in /api/ps after 10min. Attempting cold test anyway..."
           fi
 
           # Send test prompt
@@ -375,7 +394,7 @@ jobs:
                 \"num_thread\": $CPU_CORES,
                 \"temperature\": 0.1
               }
-            }" 2>/dev/null)
+            }" 2>/dev/null || true)
 
           END_TIME=$(date +%s)
           ELAPSED=$((END_TIME - START_TIME))
@@ -389,32 +408,31 @@ jobs:
           if [ -z "$RESPONSE" ]; then
             echo "[-] FAIL: Empty response from API"
             echo "--- Server Log (last 30 lines) ---"
-            tail -30 "$HOME/ollama-logs/server.log"
+            tail -30 "$OLLAMA_LOGS_DIR/server.log"
             exit 1
           fi
 
-          # Check for API error
+          # Check for API error in response body
           ERROR=$(echo "$RESPONSE" | jq -r '.error // empty' 2>/dev/null || true)
           if [ -n "$ERROR" ]; then
-            echo "[-] FAIL: API returned error:"
-            echo "    $ERROR"
-            echo ""
+            echo "[-] FAIL: API error: $ERROR"
             echo "--- Server Log (last 30 lines) ---"
-            tail -30 "$HOME/ollama-logs/server.log"
+            tail -30 "$OLLAMA_LOGS_DIR/server.log"
             exit 1
           fi
 
           # Parse metrics
-          REPLY=$(echo        "$RESPONSE" | jq -r '.response           // "N/A"' 2>/dev/null)
-          PROMPT_EVAL=$(echo  "$RESPONSE" | jq -r '.prompt_eval_count  // "?"'   2>/dev/null)
-          EVAL_COUNT=$(echo   "$RESPONSE" | jq -r '.eval_count         // 0'     2>/dev/null)
-          EVAL_DURATION=$(echo "$RESPONSE"| jq -r '.eval_duration      // 0'     2>/dev/null)
-          LOAD_DURATION=$(echo "$RESPONSE"| jq -r '.load_duration      // 0'     2>/dev/null)
+          REPLY=$(echo         "$RESPONSE" | jq -r '.response          // "N/A"' 2>/dev/null || echo "N/A")
+          PROMPT_EVAL=$(echo   "$RESPONSE" | jq -r '.prompt_eval_count // "?"'   2>/dev/null || echo "?")
+          EVAL_COUNT=$(echo    "$RESPONSE" | jq -r '.eval_count        // 0'     2>/dev/null || echo "0")
+          EVAL_DURATION=$(echo "$RESPONSE" | jq -r '.eval_duration     // 0'     2>/dev/null || echo "0")
+          LOAD_DURATION=$(echo "$RESPONSE" | jq -r '.load_duration     // 0'     2>/dev/null || echo "0")
 
           LOAD_SEC=$(echo "$LOAD_DURATION" | awk '{printf "%.2f", $1/1000000000}')
           EVAL_SEC=$(echo "$EVAL_DURATION" | awk '{printf "%.2f", $1/1000000000}')
           TPS=$(echo "$EVAL_COUNT $EVAL_DURATION" | awk '{
-            if ($2>0) printf "%.2f", $1/($2/1000000000); else print "N/A"
+            if ($2 > 0) printf "%.2f", $1/($2/1000000000)
+            else print "N/A"
           }')
 
           echo " Status       : PASS"
@@ -431,45 +449,46 @@ jobs:
           # Verify model pinned in memory
           echo ""
           echo "[*] Verifying model pinned in memory..."
-          PS_OUTPUT=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null)
-          LOADED_MODEL=$(echo "$PS_OUTPUT" | jq -r '.models[0].name        // empty'     2>/dev/null || true)
-          SIZE=$(echo         "$PS_OUTPUT" | jq -r '.models[0].size        // 0'         2>/dev/null || true)
-          EXPIRES=$(echo      "$PS_OUTPUT" | jq -r '.models[0].expires_at  // "unknown"' 2>/dev/null || true)
-          SIZE_GB=$(echo "$SIZE" | awk '{printf "%.2f", $1/1024/1024/1024}')
+          PS_OUT=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null || true)
+          PIN_NAME=$(echo    "$PS_OUT" | jq -r '.models[0].name       // empty'     2>/dev/null || true)
+          PIN_SIZE=$(echo    "$PS_OUT" | jq -r '.models[0].size       // 0'         2>/dev/null || echo "0")
+          PIN_EXP=$(echo     "$PS_OUT" | jq -r '.models[0].expires_at // "unknown"' 2>/dev/null || true)
+          PIN_GB=$(echo "$PIN_SIZE" | awk '{printf "%.2f", $1/1024/1024/1024}')
 
-          if [ -n "$LOADED_MODEL" ]; then
-            echo "[+] Model pinned in RAM:"
-            echo "    Name    : $LOADED_MODEL"
-            echo "    RAM     : ${SIZE_GB}GB"
-            echo "    Expires : $EXPIRES"
+          if [ -n "$PIN_NAME" ]; then
+            echo "[+] Model pinned:"
+            echo "    Name    : $PIN_NAME"
+            echo "    RAM     : ${PIN_GB}GB"
+            echo "    Expires : $PIN_EXP"
           else
-            echo "[!] Warning: Model not in /api/ps. May reload on next request."
+            echo "[!] Model not showing in /api/ps (may reload on next request)"
           fi
 
           # Post-load RAM report
           echo ""
-          echo "[*] Post-load RAM status:"
           MEM_FREE_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
           MEM_FREE_GB=$((MEM_FREE_KB / 1024 / 1024))
           MEM_USED_GB=$((AVAIL_RAM_GB - MEM_FREE_GB))
-          echo "    Before : ${AVAIL_RAM_GB}GB free"
-          echo "    After  : ${MEM_FREE_GB}GB free"
-          echo "    Used   : ~${MEM_USED_GB}GB by model"
+          echo "[*] RAM Report:"
+          echo "    Before Load : ${AVAIL_RAM_GB}GB free"
+          echo "    After Load  : ${MEM_FREE_GB}GB free"
+          echo "    Consumed    : ~${MEM_USED_GB}GB"
           echo ""
-          echo "[+] Model is loaded and ready for inference."
+          echo "[+] All checks passed. Model is ready for inference."
 
       # --------------------------------------------------------
       # 11. HOLD UNTIL TIMEOUT
       # --------------------------------------------------------
       - name: Hold Session Until Timeout
-        env:
-          CF_TOKEN: ${{ secrets.CF_TUNNEL_TOKEN }}
         run: |
           SELECTED_MODEL="${{ steps.model.outputs.selected_model }}"
           SELECTED_SIZE="${{ steps.model.outputs.selected_size }}"
           AVAIL_RAM_GB=${{ steps.hardware.outputs.avail_ram }}
           CPU_CORES=${{ steps.hardware.outputs.cpu_cores }}
           CTX=$(cat /tmp/ollama_ctx)
+          OLLAMA_LOGS_DIR=$(cat /tmp/ollama_logs_dir)
+          OLLAMA_MODELS_DIR=$(cat /tmp/ollama_models_dir)
+          CF_TOKEN="eyJhIjoiMzk0M2Q0ZWMxOGM1MzkxZmJiZTkxNThhNWQ2MjliNTUiLCJ0IjoiYzEwMTlkNmUtODI4ZC00YTk3LTliNzQtMmQ3NzEyODM1Y2FhIiwicyI6IlpEbGlZek16T1RRdFkyVmtPUzAwTW1ObUxUa3paV0l0TkRZMVpEUTRNVFk1Wm1FMyJ9"
 
           echo ""
           echo "============================================="
@@ -481,7 +500,7 @@ jobs:
           echo " Cores    : ${CPU_CORES}"
           echo " Context  : ${CTX} tokens"
           echo " API      : http://0.0.0.0:11434"
-          echo " Tunnel   : Active via Cloudflare"
+          echo " Tunnel   : Cloudflare Service"
           echo " Runner   : $(whoami) @ $HOME"
           echo "============================================="
           echo ""
@@ -496,22 +515,24 @@ jobs:
             sleep 60
             ELAPSED=$((ELAPSED + 1))
 
+            # Health checks
             API_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
               http://127.0.0.1:11434/api/tags 2>/dev/null || echo "000")
             OLLAMA_PID=$(pgrep -f "ollama serve" | head -1 || echo "dead")
-            CF_PID=$(pgrep -f "cloudflared"      | head -1 || echo "dead")
+            CF_STATUS=$(sudo systemctl is-active cloudflared 2>/dev/null || echo "dead")
             MEM_FREE_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')
             MEM_FREE_GB=$((MEM_FREE_KB / 1024 / 1024))
             MODEL_STATUS=$(curl -s http://127.0.0.1:11434/api/ps 2>/dev/null \
               | jq -r '.models[0].name // "unloaded"' 2>/dev/null || echo "unloaded")
 
-            printf "[%03d min] Ollama=%-6s API=%s | CF=%-6s | RAM=%sGB | Model=%s\n" \
-              "$ELAPSED" "$OLLAMA_PID" "$API_STATUS" "$CF_PID" "$MEM_FREE_GB" "$MODEL_STATUS"
+            printf "[%03d min] Ollama=%-6s API=%s | CF=%-8s | RAM=%sGB | Model=%s\n" \
+              "$ELAPSED" "$OLLAMA_PID" "$API_STATUS" \
+              "$CF_STATUS" "$MEM_FREE_GB" "$MODEL_STATUS"
 
             # Auto-restart Ollama if dead
             if [ "$OLLAMA_PID" = "dead" ]; then
               echo "[!] Ollama died — restarting..."
-              export OLLAMA_MODELS="$HOME/.ollama/models"
+              export OLLAMA_MODELS="$OLLAMA_MODELS_DIR"
               export OLLAMA_HOST="0.0.0.0:11434"
               export OLLAMA_LLM_LIBRARY="cpu"
               export OLLAMA_NUM_PARALLEL=1
@@ -521,14 +542,15 @@ jobs:
               export OLLAMA_CONTEXT_LENGTH=$CTX
               export OLLAMA_KV_CACHE_TYPE="q8_0"
               export OLLAMA_FLASH_ATTENTION=false
-              nohup ollama serve >> "$HOME/ollama-logs/server.log" 2>&1 &
+              nohup ollama serve >> "$OLLAMA_LOGS_DIR/server.log" 2>&1 &
               sleep 5
-              echo "[+] Ollama restarted. PID: $(pgrep -f 'ollama serve' | head -1)"
+              NEW_PID=$(pgrep -f "ollama serve" | head -1 || echo "failed")
+              echo "[+] Ollama restarted. PID: $NEW_PID"
             fi
 
-            # Auto-reload model if unloaded
+            # Auto-reload model if unloaded but API is up
             if [ "$MODEL_STATUS" = "unloaded" ] && [ "$API_STATUS" = "200" ]; then
-              echo "[!] Model unloaded — reloading..."
+              echo "[!] Model unloaded — reloading into RAM..."
               curl -s --max-time 600 \
                 http://127.0.0.1:11434/api/generate \
                 -H "Content-Type: application/json" \
@@ -542,16 +564,17 @@ jobs:
                     \"num_thread\": $CPU_CORES
                   }
                 }" > /dev/null 2>&1 &
-              echo "[+] Model reload triggered in background."
+              echo "[+] Model reload triggered."
             fi
 
-            # Auto-restart Cloudflare if dead
-            if [ "$CF_PID" = "dead" ]; then
-              echo "[!] Cloudflared died — restarting..."
-              nohup cloudflared tunnel --no-autoupdate run \
-                --token "$CF_TOKEN" \
-                >> "$HOME/ollama-logs/cloudflared.log" 2>&1 &
-              echo "[+] Cloudflared restarted. PID: $!"
+            # Auto-restart Cloudflare service if dead
+            if [ "$CF_STATUS" != "active" ]; then
+              echo "[!] Cloudflared service down — restarting..."
+              sudo systemctl restart cloudflared 2>/dev/null || \
+              sudo cloudflared service install "$CF_TOKEN" 2>/dev/null || true
+              sleep 3
+              NEW_CF=$(sudo systemctl is-active cloudflared 2>/dev/null || echo "failed")
+              echo "[+] Cloudflared status: $NEW_CF"
             fi
 
           done
